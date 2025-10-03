@@ -1,6 +1,26 @@
 #define SBRK_ERROR ((char *)-1)
 
+// 状态常量定义
+#define UNUSED   0
+#define USED     1
+#define SLEEPING 2
+#define RUNNABLE 3
+#define RUNNING  4
+#define ZOMBIE   5
+
 struct stat;
+struct proc_info {
+    int pid;
+    int priority;
+    int current_cpu_time;
+    int current_wait_time;
+    int total_cpu_time;
+    int total_wait_time;
+    int turnaround_time;
+    int state;
+    char name[16];
+};
+
 
 // system calls
 int fork(void);
@@ -25,6 +45,7 @@ char* sys_sbrk(int,int);
 int pause(int);
 int uptime(void);
 
+
 // ulib.c
 int stat(const char*, struct stat*);
 char* strcpy(char*, const char*);
@@ -47,3 +68,7 @@ void printf(const char*, ...) __attribute__ ((format (printf, 1, 2)));
 // umalloc.c
 void* malloc(uint);
 void free(void*);
+
+// 添加系统调用声明
+int setpriority(int, int);
+int getprocinfo(struct proc_info*);

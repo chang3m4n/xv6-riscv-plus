@@ -1,5 +1,3 @@
-// Mutual exclusion spin locks.
-
 #include "types.h"
 #include "param.h"
 #include "memlayout.h"
@@ -14,6 +12,16 @@ initlock(struct spinlock *lk, char *name)
   lk->name = name;
   lk->locked = 0;
   lk->cpu = 0;
+}
+
+// Check whether this cpu is holding the lock.
+// Interrupts must be off.
+int
+holding(struct spinlock *lk)
+{
+  int r;
+  r = (lk->locked && lk->cpu == mycpu());
+  return r;
 }
 
 // Acquire the lock.
@@ -53,9 +61,7 @@ release(struct spinlock *lk)
 
   // Tell the C compiler and the CPU to not move loads or stores
   // past this point, to ensure that all the stores in the critical
-  // section are visible to other CPUs before the lock is released,
-  // and that loads in the critical section occur strictly before
-  // the lock is released.
+  // section are visible to other CPUs before the lock is released.
   // On RISC-V, this emits a fence instruction.
   __sync_synchronize();
 
@@ -71,16 +77,6 @@ release(struct spinlock *lk)
   pop_off();
 }
 
-// Check whether this cpu is holding the lock.
-// Interrupts must be off.
-int
-holding(struct spinlock *lk)
-{
-  int r;
-  r = (lk->locked && lk->cpu == mycpu());
-  return r;
-}
-
 // push_off/pop_off are like intr_off()/intr_on() except that they are matched:
 // it takes two pop_off()s to undo two push_off()s.  Also, if interrupts
 // are initially off, then push_off, pop_off leaves them off.
@@ -90,10 +86,7 @@ push_off(void)
 {
   int old = intr_get();
 
-  // disable interrupts to prevent an involuntary context
-  // switch while using mycpu().
   intr_off();
-
   if(mycpu()->noff == 0)
     mycpu()->intena = old;
   mycpu()->noff += 1;

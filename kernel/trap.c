@@ -16,6 +16,8 @@ void kernelvec();
 
 extern int devintr();
 
+extern void update_all_process_times(void);
+
 void
 trapinit(void)
 {
@@ -81,8 +83,10 @@ usertrap(void)
     kexit(-1);
 
   // give up the CPU if this is a timer interrupt.
-  if(which_dev == 2)
+  if(which_dev == 2){
+    update_all_process_times();
     yield();
+  }
 
   prepare_return();
 
@@ -152,8 +156,10 @@ kerneltrap()
   }
 
   // give up the CPU if this is a timer interrupt.
-  if(which_dev == 2 && myproc() != 0)
+  if(which_dev == 2 && myproc() != 0){
+    update_all_process_times();
     yield();
+  }
 
   // the yield() may have caused some traps to occur,
   // so restore trap registers for use by kernelvec.S's sepc instruction.

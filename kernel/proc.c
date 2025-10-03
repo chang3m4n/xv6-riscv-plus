@@ -5,15 +5,20 @@
 #include "spinlock.h"
 #include "proc.h"
 #include "defs.h"
+#include "vm.h"
 
 struct cpu cpus[NCPU];
 
 struct proc proc[NPROC];
 
+struct spinlock lock_table_lock;
+struct spinlock wait_lock;
+struct spinlock pid_lock;
+
 struct proc *initproc;
 
 int nextpid = 1;
-struct spinlock pid_lock;
+
 
 extern void forkret(void);
 static void freeproc(struct proc *p);
@@ -24,7 +29,81 @@ extern char trampoline[]; // trampoline.S
 // parents are not lost. helps obey the
 // memory model when using p->parent.
 // must be acquired before any p->lock.
-struct spinlock wait_lock;
+
+void update_all_process_times(void);
+
+
+static void
+update_priority(struct proc *p)
+{
+    int old_prio = p->priority;
+    int cpu_penalty = p->cpu_time / 50;
+    int wait_reward = p->wait_time / 30;
+    
+    p->priority += cpu_penalty - wait_reward;
+    if(p->priority != old_prio) {
+        p->cpu_time = 0;
+        p->wait_time = 0;
+    }
+    
+    if (p->priority < 1) p->priority = 1;
+    if (p->priority > 20) p->priority = 20;
+}
+
+// 状态转换钩子函数
+void
+on_state_change(struct proc *p, enum procstate old_state, enum procstate new_state)
+{
+    if (p == 0 || old_state == ZOMBIE) return;
+    int now = ticks;
+    int elapsed = now - p->last_update;
+    
+    if (elapsed > 0) {
+        if (old_state == RUNNING) {
+            p->cpu_time += elapsed;
+            p->total_cpu_time += elapsed;
+        } else if (old_state == RUNNABLE || old_state == SLEEPING) {
+            p->wait_time += elapsed;
+            p->total_wait_time += elapsed;
+        }
+        
+        p->last_update = now;
+        update_priority(p);
+    }
+}
+
+// 全局时间更新函数（在计时器中断中调用）
+void
+update_all_process_times(void)
+{
+    struct proc *p;
+    int now;
+    
+    acquire(&tickslock);
+    now = ticks;
+    release(&tickslock);
+    
+    for (p = proc; p < &proc[NPROC]; p++) {
+        if (p->state == UNUSED || p->state == ZOMBIE)
+            continue;
+        acquire(&p->lock);
+        if (p->state != UNUSED && p->state != ZOMBIE) {
+            int elapsed = now - p->last_update;
+            if (elapsed > 0) {
+                if (p->state == RUNNING) {
+                    p->cpu_time += elapsed;
+                    p->total_cpu_time += elapsed;
+                } else if (p->state == RUNNABLE || p->state == SLEEPING) {
+                    p->wait_time += elapsed;
+                    p->total_wait_time += elapsed;
+                }
+                p->last_update = now;
+                update_priority(p);
+            }
+        }
+        release(&p->lock);
+    }
+}
 
 // Allocate a page for each process's kernel stack.
 // Map it high in memory, followed by an invalid
@@ -50,7 +129,6 @@ procinit(void)
   struct proc *p;
   
   initlock(&pid_lock, "nextpid");
-  initlock(&wait_lock, "wait_lock");
   for(p = proc; p < &proc[NPROC]; p++) {
       initlock(&p->lock, "proc");
       p->state = UNUSED;
@@ -124,6 +202,15 @@ allocproc(void)
 found:
   p->pid = allocpid();
   p->state = USED;
+
+  p->create_time = ticks;
+  p->cpu_time = 0;
+  p->wait_time = 0;
+  p->total_cpu_time = 0;
+  p->total_wait_time = 0;
+  p->last_update = ticks;
+  p->priority = 10; // 默认优先级
+  p->turnaround_time = 0;
 
   // Allocate a trapframe page.
   if((p->trapframe = (struct trapframe *)kalloc()) == 0){
@@ -226,7 +313,10 @@ userinit(void)
   
   p->cwd = namei("/");
 
+  // 使用状态转换钩子
+  enum procstate old_state = p->state;
   p->state = RUNNABLE;
+  on_state_change(p, old_state, p->state);
 
   release(&p->lock);
 }
@@ -295,8 +385,11 @@ kfork(void)
   np->parent = p;
   release(&wait_lock);
 
+  // 使用状态转换钩子
   acquire(&np->lock);
+  enum procstate old_state = np->state;
   np->state = RUNNABLE;
+  on_state_change(np, old_state, np->state);
   release(&np->lock);
 
   return pid;
@@ -320,46 +413,42 @@ reparent(struct proc *p)
 // Exit the current process.  Does not return.
 // An exited process remains in the zombie state
 // until its parent calls wait().
-void
-kexit(int status)
-{
-  struct proc *p = myproc();
 
-  if(p == initproc)
-    panic("init exiting");
+void kexit(int status) {
+    struct proc *p = myproc();
+    if(p == initproc) panic("init exiting");
 
-  // Close all open files.
-  for(int fd = 0; fd < NOFILE; fd++){
-    if(p->ofile[fd]){
-      struct file *f = p->ofile[fd];
-      fileclose(f);
-      p->ofile[fd] = 0;
+    // 1. 关闭文件、释放资源（原有逻辑保留）
+    for(int fd = 0; fd < NOFILE; fd++){
+        if(p->ofile[fd]){ 
+            fileclose(p->ofile[fd]); 
+            p->ofile[fd] = 0; 
+        }
     }
-  }
+    begin_op(); 
+    iput(p->cwd); 
+    end_op(); 
+    p->cwd = 0;
 
-  begin_op();
-  iput(p->cwd);
-  end_op();
-  p->cwd = 0;
+    // 2. 状态转换：停止时间统计，设为僵尸态（关键：持有 p->lock 直到 sched() 调用后）
+    acquire(&p->lock);
+    enum procstate old_state = p->state;
+    p->state = ZOMBIE; 
+    on_state_change(p, old_state, p->state); 
+    p->turnaround_time = ticks - p->create_time;
+    p->xstate = status;
+    
+    // 3. 重定向子进程、唤醒父进程（原有逻辑保留，但需在 p->lock 持有期间调用 sched()）
+    acquire(&wait_lock);
+    reparent(p);
+    wakeup(p->parent);
+    release(&wait_lock);
 
-  acquire(&wait_lock);
-
-  // Give any children to init.
-  reparent(p);
-
-  // Parent might be sleeping in wait().
-  wakeup(p->parent);
-  
-  acquire(&p->lock);
-
-  p->xstate = status;
-  p->state = ZOMBIE;
-
-  release(&wait_lock);
-
-  // Jump into the scheduler, never to return.
-  sched();
-  panic("zombie exit");
+    // 关键修复：在持有 p->lock 时调用 sched()
+    sched(); 
+    // sched() 会切换到调度器，后续代码不会执行，无需释放 p->lock
+    
+    panic("zombie exit"); // 此句不会执行，仅为安全兜底
 }
 
 // Wait for a child process to exit and return its pid.
@@ -418,47 +507,56 @@ kwait(uint64 addr)
 //  - swtch to start running that process.
 //  - eventually that process transfers control
 //    via swtch back to the scheduler.
+
 void
 scheduler(void)
 {
-  struct proc *p;
-  struct cpu *c = mycpu();
+    struct proc *p;
+    struct proc *selected_proc = 0;
+    struct cpu *c = mycpu();
+    
+    c->proc = 0;
 
-  c->proc = 0;
-  for(;;){
-    // The most recent process to run may have had interrupts
-    // turned off; enable them to avoid a deadlock if all
-    // processes are waiting. Then turn them back off
-    // to avoid a possible race between an interrupt
-    // and wfi.
-    intr_on();
-    intr_off();
+    for(;;){
+        intr_on();
+        
+        // 第一步：遍历所有进程，找到优先级最高的 RUNNABLE 进程
+        selected_proc = 0;
+        for(p = proc; p < &proc[NPROC]; p++) {
+            acquire(&p->lock);
+            if(p->state == RUNNABLE) {
+                if(selected_proc == 0 || p->priority < selected_proc->priority) {
+                    if(selected_proc != 0) {
+                        release(&selected_proc->lock);
+                    }
+                    selected_proc = p;
+                } else {
+                    release(&p->lock);
+                }
+            } else {
+                release(&p->lock);
+            }
+        }
 
-    int found = 0;
-    for(p = proc; p < &proc[NPROC]; p++) {
-      acquire(&p->lock);
-      if(p->state == RUNNABLE) {
-        // Switch to chosen process.  It is the process's job
-        // to release its lock and then reacquire it
-        // before jumping back to us.
-        p->state = RUNNING;
-        c->proc = p;
-        swtch(&c->context, &p->context);
-
-        // Process is done running for now.
-        // It should have changed its p->state before coming back.
-        c->proc = 0;
-        found = 1;
-      }
-      release(&p->lock);
+        // 第二步：如果有选中的进程，进行调度
+        if(selected_proc != 0) {
+            enum procstate old_state = selected_proc->state;
+            selected_proc->state = RUNNING;
+            on_state_change(selected_proc, old_state, selected_proc->state);
+            
+            c->proc = selected_proc;
+            swtch(&c->context, &selected_proc->context);
+            c->proc = 0;
+            if(selected_proc->state == RUNNING) {
+                enum procstate current_old_state = selected_proc->state;
+                selected_proc->state = RUNNABLE;
+                on_state_change(selected_proc, current_old_state, selected_proc->state);
+            }
+            release(&selected_proc->lock);
+            selected_proc = 0;
+        }
     }
-    if(found == 0) {
-      // nothing to run; stop running on this core until an interrupt.
-      asm volatile("wfi");
-    }
-  }
 }
-
 // Switch to scheduler.  Must hold only p->lock
 // and have changed proc->state. Saves and restores
 // intena because intena is a property of this
@@ -492,8 +590,14 @@ yield(void)
 {
   struct proc *p = myproc();
   acquire(&p->lock);
+  
+  enum procstate old_state = p->state;
   p->state = RUNNABLE;
+  on_state_change(p, old_state, p->state);
+  
   sched();
+  
+  // 当进程重新被调度时，从这里继续执行
   release(&p->lock);
 }
 
@@ -551,9 +655,13 @@ sleep(void *chan, struct spinlock *lk)
   acquire(&p->lock);  //DOC: sleeplock1
   release(lk);
 
+  // 使用状态转换钩子
+  enum procstate old_state = p->state;
+  
   // Go to sleep.
   p->chan = chan;
   p->state = SLEEPING;
+  on_state_change(p, old_state, p->state);
 
   sched();
 
@@ -576,7 +684,10 @@ wakeup(void *chan)
     if(p != myproc()){
       acquire(&p->lock);
       if(p->state == SLEEPING && p->chan == chan) {
+        // 使用状态转换钩子
+        enum procstate old_state = p->state;
         p->state = RUNNABLE;
+        on_state_change(p, old_state, p->state);
       }
       release(&p->lock);
     }
@@ -596,8 +707,10 @@ kkill(int pid)
     if(p->pid == pid){
       p->killed = 1;
       if(p->state == SLEEPING){
-        // Wake process from sleep().
+        // 使用状态转换钩子
+        enum procstate old_state = p->state;
         p->state = RUNNABLE;
+        on_state_change(p, old_state, p->state);
       }
       release(&p->lock);
       return 0;
@@ -641,6 +754,7 @@ either_copyout(int user_dst, uint64 dst, void *src, uint64 len)
   }
 }
 
+
 // Copy from either a user address, or kernel address,
 // depending on usr_src.
 // Returns 0 on success, -1 on error.
@@ -659,12 +773,13 @@ either_copyin(void *dst, int user_src, uint64 src, uint64 len)
 // Print a process listing to console.  For debugging.
 // Runs when user types ^P on console.
 // No lock to avoid wedging a stuck machine further.
+
 void
 procdump(void)
 {
   static char *states[] = {
   [UNUSED]    "unused",
-  [USED]      "used",
+  [USED]      "used", 
   [SLEEPING]  "sleep ",
   [RUNNABLE]  "runble",
   [RUNNING]   "run   ",
@@ -673,15 +788,78 @@ procdump(void)
   struct proc *p;
   char *state;
 
-  printf("\n");
+  printf("\nPID\tSTATE\tPRIO\tRUNTIME\tWAITTIME\tTOTAL_CPU\tTOTAL_WAIT\n");
   for(p = proc; p < &proc[NPROC]; p++){
     if(p->state == UNUSED)
       continue;
-    if(p->state >= 0 && p->state < NELEM(states) && states[p->state])
-      state = states[p->state];
-    else
-      state = "???";
-    printf("%d %s %s", p->pid, state, p->name);
-    printf("\n");
+    
+    // 获取状态字符串
+    state = (p->state >= 0 && p->state < NELEM(states)) ? states[p->state] : "???";
+    
+    // 打印进程信息（使用state变量）
+    printf("%d\t%s\t%d\t%u\t%u\t%u\t%u\n",
+           p->pid, state, p->priority, p->cpu_time, p->wait_time,
+           p->total_cpu_time, p->total_wait_time);
   }
 }
+
+// 添加设置优先级的系统调用
+uint64
+sys_setpriority(void)
+{
+  int pid,prio;
+  argint(0, &pid);
+  argint(1, &prio);
+  
+  struct proc *p;
+  for(p = proc; p < &proc[NPROC]; p++){
+    acquire(&p->lock);
+    if(p->pid == pid && p->state != UNUSED){
+      p->priority = prio;
+      release(&p->lock);
+      return 0;
+    }
+    release(&p->lock);
+  }
+  return -1;  // 未找到进程
+}
+
+// 添加获取进程信息的系统调用
+// 修改进程信息结构体，添加name字段
+uint64
+sys_getprocinfo(void)
+{
+    uint64 addr;  // 用户空间缓冲区地址
+    argaddr(0, &addr);
+    
+    struct proc_info info[NPROC];
+    
+    int count = 0;
+    struct proc *p;
+    for(p = proc; p < &proc[NPROC]; p++){
+        acquire(&p->lock);
+        if(p->state != UNUSED){
+            info[count].pid = p->pid;
+            info[count].priority = p->priority;
+            info[count].current_cpu_time = p->cpu_time;
+            info[count].current_wait_time = p->wait_time;
+            info[count].total_cpu_time = p->total_cpu_time;
+            info[count].total_wait_time = p->total_wait_time;
+            info[count].state = p->state;
+            info[count].turnaround_time = p->turnaround_time; // 记录周转时间
+            
+            // 复制进程名（确保以null结尾）
+            safestrcpy(info[count].name, p->name, sizeof(info[count].name));
+            
+            count++;
+        }
+        release(&p->lock);
+    }
+    
+    struct proc *curproc = myproc();
+    if(copyout(curproc->pagetable, addr, (char*)info, count * sizeof(struct proc_info)) < 0)
+        return -1;
+    
+    return count;
+}
+
